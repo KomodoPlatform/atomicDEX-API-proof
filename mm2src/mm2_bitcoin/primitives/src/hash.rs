@@ -1,11 +1,13 @@
 //! Fixed-size hashes
 
+use bitcoin_hashes::{sha256d, Hash as ExtHash};
 use hex::{FromHex, FromHexError, ToHex};
 use std::hash::{Hash, Hasher};
 use std::{cmp, fmt, ops, str};
 
 macro_rules! impl_hash {
     ($name: ident, $size: expr) => {
+        #[derive(Copy)]
         #[repr(C)]
         pub struct $name([u8; $size]);
 
@@ -163,5 +165,8 @@ impl H256 {
     pub fn from_reversed_str(s: &'static str) -> Self { H256::from(s).reversed() }
 
     #[inline]
-    pub fn to_reversed_str(&self) -> String { self.reversed().to_string() }
+    pub fn to_reversed_str(self) -> String { self.reversed().to_string() }
+
+    #[inline]
+    pub fn to_sha256d(self) -> sha256d::Hash { sha256d::Hash::from_inner(self.take()) }
 }
