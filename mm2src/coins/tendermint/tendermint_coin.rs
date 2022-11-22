@@ -45,7 +45,7 @@ use futures::{FutureExt, TryFutureExt};
 use futures01::Future;
 use hex::FromHexError;
 use keys::KeyPair;
-use mm2_core::mm_ctx::{MmArc, MmWeak};
+use mm2_core::mm_ctx::MmArc;
 use mm2_err_handle::prelude::*;
 use mm2_number::MmNumber;
 use parking_lot::Mutex as PaMutex;
@@ -120,21 +120,17 @@ pub struct TendermintConf {
 
 impl TendermintConf {
     pub fn try_from_json(ticker: &str, conf: &Json) -> MmResult<Self, TendermintInitError> {
-        let avg_blocktime = conf.get("avg_blocktime").ok_or({
-            TendermintInitError {
-                ticker: ticker.to_string(),
-                kind: TendermintInitErrorKind::AvgBlockTimeMissing,
-            }
+        let avg_blocktime = conf.get("avg_blocktime").or_mm_err(|| TendermintInitError {
+            ticker: ticker.to_string(),
+            kind: TendermintInitErrorKind::AvgBlockTimeMissing,
         })?;
 
-        let avg_blocktime = avg_blocktime.as_i64().ok_or({
-            TendermintInitError {
-                ticker: ticker.to_string(),
-                kind: TendermintInitErrorKind::AvgBlockTimeInvalid,
-            }
+        let avg_blocktime = avg_blocktime.as_i64().or_mm_err(|| TendermintInitError {
+            ticker: ticker.to_string(),
+            kind: TendermintInitErrorKind::AvgBlockTimeInvalid,
         })?;
 
-        let avg_blocktime = u8::try_from(avg_blocktime).map_err(|_| TendermintInitError {
+        let avg_blocktime = u8::try_from(avg_blocktime).map_to_mm(|_| TendermintInitError {
             ticker: ticker.to_string(),
             kind: TendermintInitErrorKind::AvgBlockTimeInvalid,
         })?;
@@ -170,7 +166,6 @@ pub struct TendermintCoinImpl {
     /// or on [`MmArc::stop`].
     pub(super) abortable_system: AbortableQueue,
     pub(crate) history_sync_state: Mutex<HistorySyncState>,
-    pub ctx: MmWeak,
 }
 
 #[derive(Clone)]
@@ -242,6 +237,10 @@ impl From<TendermintCoinRpcError> for ValidatePaymentError {
             TendermintCoinRpcError::PerformError(e) => ValidatePaymentError::Transport(e),
         }
     }
+}
+
+impl From<TendermintCoinRpcError> for TradePreimageError {
+    fn from(err: TendermintCoinRpcError) -> Self { TradePreimageError::Transport(err.to_string()) }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -411,7 +410,6 @@ impl TendermintCoin {
             tokens_info: PaMutex::new(HashMap::new()),
             abortable_system,
             history_sync_state: Mutex::new(history_sync_state),
-            ctx: ctx.weak(),
         })))
     }
 
@@ -1102,14 +1100,9 @@ impl TendermintCoin {
                 e
             )))
         })?;
-        let timeout_height = current_block + TIMEOUT_HEIGHT_DELTA;
 
-        let account_info = self.my_account_info().await.map_err(|e| {
-            MmError::new(TradePreimageError::InternalError(format!(
-                "Could not get account_info. {}",
-                e
-            )))
-        })?;
+        let timeout_height = current_block + TIMEOUT_HEIGHT_DELTA;
+        let account_info = self.my_account_info().await?;
 
         let simulated_tx = self
             .gen_simulated_tx(
@@ -1125,11 +1118,7 @@ impl TendermintCoin {
                 )))
             })?;
 
-        let fee_uamount = self
-            .calculate_fee_amount_as_u64(simulated_tx)
-            .await
-            .map_err(|e| MmError::new(TradePreimageError::Transport(format!("{:?}", e.into_inner()))))?;
-
+        let fee_uamount = self.calculate_fee_amount_as_u64(simulated_tx).await?;
         let fee_amount = big_decimal_from_sat_unsigned(fee_uamount, self.decimals);
 
         Ok(TradeFee {
@@ -1156,14 +1145,9 @@ impl TendermintCoin {
                 e
             )))
         })?;
-        let timeout_height = current_block + TIMEOUT_HEIGHT_DELTA;
 
-        let account_info = self.my_account_info().await.map_err(|e| {
-            MmError::new(TradePreimageError::InternalError(format!(
-                "Could not get account_info. {}",
-                e
-            )))
-        })?;
+        let timeout_height = current_block + TIMEOUT_HEIGHT_DELTA;
+        let account_info = self.my_account_info().await?;
 
         let msg_send = MsgSend {
             from_address: self.account_id.clone(),
@@ -1185,11 +1169,7 @@ impl TendermintCoin {
                 )))
             })?;
 
-        let fee_uamount = self
-            .calculate_fee_amount_as_u64(simulated_tx)
-            .await
-            .map_err(|e| MmError::new(TradePreimageError::Transport(format!("{:?}", e.into_inner()))))?;
-
+        let fee_uamount = self.calculate_fee_amount_as_u64(simulated_tx).await?;
         let fee_amount = big_decimal_from_sat_unsigned(fee_uamount, decimals);
 
         Ok(TradeFee {
@@ -1301,7 +1281,7 @@ impl TendermintCoin {
                 let request = GetTxsEventRequest {
                     events: vec![events_string],
                     pagination: None,
-                    order_by: TendermintResultOrder::Ascending.into(),
+                    order_by: TendermintResultOrder::Ascending as i32,
                 };
                 let encoded_request = request.encode_to_vec();
 
@@ -1746,7 +1726,7 @@ impl MarketCoinOps for TendermintCoin {
         let request = GetTxsEventRequest {
             events: vec![events_string],
             pagination: None,
-            order_by: TendermintResultOrder::Ascending.into(),
+            order_by: TendermintResultOrder::Ascending as i32,
         };
         let encoded_request = request.encode_to_vec();
 
@@ -2356,7 +2336,7 @@ pub mod tendermint_coin_tests {
         let request = GetTxsEventRequest {
             events: vec![events.into()],
             pagination: None,
-            order_by: TendermintResultOrder::Ascending.into(),
+            order_by: TendermintResultOrder::Ascending as i32,
         };
         let path = AbciPath::from_str(ABCI_GET_TXS_EVENT_PATH).unwrap();
         let response = block_on(block_on(coin.rpc_client()).unwrap().abci_query(
