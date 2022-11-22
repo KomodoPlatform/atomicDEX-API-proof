@@ -1,6 +1,3 @@
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-
 use super::iris::htlc_proto::QueryHtlcResponseProto;
 use super::{rpc::*, type_urls::*, AllBalancesResult, TendermintCoin, TendermintCoinRpcError, TendermintToken};
 
@@ -24,6 +21,7 @@ use mm2_number::BigDecimal;
 use primitives::hash::H256;
 use prost::Message;
 use rpc::v1::types::Bytes as BytesJson;
+use std::collections::{hash_map::Entry, HashMap};
 
 macro_rules! try_or_return_stopped_as_err {
     ($exp:expr, $reason: expr, $fmt:literal) => {
