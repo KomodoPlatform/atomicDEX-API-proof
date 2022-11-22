@@ -87,7 +87,7 @@ impl From<CoinConfWithProtocolError> for InitTokensAsMmCoinsError {
     }
 }
 
-pub trait RegisterTokenInfo<T: TokenOf<PlatformCoin = Self>> {
+pub trait RegisterTokenInfo<T: TokenOf> {
     fn register_token_info(&self, token: &T);
 }
 

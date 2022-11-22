@@ -10,12 +10,14 @@ use crate::tendermint::iris::htlc_proto::{ClaimHtlcProtoRep, CreateHtlcProtoRep}
 use crate::tendermint::TendermintFeeDetails;
 use crate::tx_history_storage::{GetTxHistoryFilters, WalletId};
 use crate::utxo::utxo_common::big_decimal_from_sat_unsigned;
-use crate::{HistorySyncState, MarketCoinOps, TxFeeDetails};
+use crate::{HistorySyncState, MarketCoinOps, TransactionDetails, TxFeeDetails};
 use async_trait::async_trait;
 use common::executor::Timer;
 use common::log;
 use common::state_machine::prelude::*;
 use cosmrs::proto::cosmos::bank::v1beta1::MsgSend;
+use cosmrs::proto::cosmos::base::v1beta1::Coin as CoinAmount;
+use cosmrs::tx::Fee;
 use mm2_err_handle::prelude::{MmError, MmResult};
 use mm2_metrics::MetricsArc;
 use mm2_number::BigDecimal;
@@ -103,8 +105,6 @@ impl<Coin, Storage> TendermintInit<Coin, Storage> {
 
 #[derive(Debug)]
 enum StopReason {
-    #[allow(dead_code)]
-    HistoryTooLarge,
     StorageError(String),
     UnknownError(String),
     RpcClient(String),
@@ -226,16 +226,253 @@ where
     type Ctx = TendermintTxHistoryCtx<Coin, Storage>;
     type Result = ();
 
-    // TODO
-    // - claim/create htlcs will display twice
     async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
         const TX_PAGE_SIZE: u8 = 50;
 
-        async fn is_tx_exists<Storage>(storage: &Storage, wallet_id: &WalletId, internal_id: &BytesJson) -> bool
+        struct TxAmounts {
+            total: BigDecimal,
+            spent_by_me: BigDecimal,
+            received_by_me: BigDecimal,
+            my_balance_change: BigDecimal,
+        }
+
+        fn get_tx_amounts(coin_amount: &CoinAmount, decimals: u8, spent_by_me: bool) -> Result<TxAmounts, String> {
+            let amount: u64 = coin_amount.amount.parse().map_err(|e| format!("{:?}", e))?;
+            let amount = big_decimal_from_sat_unsigned(amount, decimals);
+
+            let (spent_by_me, received_by_me) = if spent_by_me {
+                (amount.clone(), BigDecimal::default())
+            } else {
+                (BigDecimal::default(), amount.clone())
+            };
+
+            Ok(TxAmounts {
+                total: amount,
+                my_balance_change: received_by_me.clone() - spent_by_me.clone(),
+                spent_by_me,
+                received_by_me,
+            })
+        }
+
+        fn get_fee_details<Coin>(fee: Fee, coin: &Coin) -> Result<TxFeeDetails, String>
         where
+            Coin: TendermintTxHistoryOps,
+        {
+            let fee_coin = fee
+                .amount
+                .first()
+                .ok_or_else(|| "fee coin can't be empty".to_string())?;
+            let fee_amount: u64 = fee_coin.amount.to_string().parse().map_err(|e| format!("{:?}", e))?;
+
+            Ok(TxFeeDetails::Tendermint(TendermintFeeDetails {
+                coin: coin.platform_ticker().to_string(),
+                amount: big_decimal_from_sat_unsigned(fee_amount, coin.decimals()),
+                gas_limit: fee.gas_limit.value(),
+            }))
+        }
+
+        fn upsert_tx_details(
+            details_map: &mut HashMap<String, Vec<TransactionDetails>>,
+            new_details: TransactionDetails,
+        ) {
+            match details_map.entry(new_details.coin.clone()) {
+                Entry::Vacant(e) => {
+                    e.insert(vec![new_details]);
+                },
+                Entry::Occupied(mut e) => {
+                    e.get_mut().push(new_details);
+                },
+            };
+        }
+
+        struct ParseTxDetailsArgs<Coin, Storage, 'a> {
+            coin: &'a Coin,
+            storage: &'a Storage,
+            active_assets: &'a HashMap<String, String>,
+            internal_id: BytesJson,
+            block_height: u64,
+            tx_hash: String,
+            tx_body_msg: &'a [u8],
+            fee_details: TxFeeDetails,
+        }
+
+        async fn parse_send_tx_details<Coin, Storage>(
+            args: ParseTxDetailsArgs<Coin, Storage, '_>,
+        ) -> Result<Option<TransactionDetails>, StopReason>
+        where
+            Coin: TendermintTxHistoryOps,
             Storage: TxHistoryStorage,
         {
-            matches!(storage.get_tx_from_history(wallet_id, internal_id).await, Ok(Some(_)))
+            let sent_tx = MsgSend::decode(args.tx_body_msg).map_err(|e| StopReason::Marshaling(e.to_string()))?;
+            let coin_amount = sent_tx
+                .amount
+                .first()
+                .ok_or_else(|| StopReason::Marshaling("amount can't be empty".to_string()))?;
+            let denom = coin_amount.denom.to_lowercase();
+
+            let tx_coin_ticker = match args.active_assets.get(&denom) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+
+            let wallet_id = WalletId::new(tx_coin_ticker.replace('-', "_"));
+            if matches!(
+                args.storage.get_tx_from_history(&wallet_id, &args.internal_id).await,
+                Ok(Some(_))
+            ) {
+                log::debug!("Tx '{}' already exists in tx_history. Skipping it.", &args.tx_hash);
+                return Ok(None);
+            } else {
+                log::debug!("Adding tx: '{}' to tx_history.", &args.tx_hash);
+            }
+
+            let address = args.coin.my_address().expect("my_address can't fail");
+            let tx_amounts = get_tx_amounts(coin_amount, args.coin.decimals(), sent_tx.from_address == address)
+                .map_err(StopReason::Marshaling)?;
+
+            Ok(Some(TransactionDetails {
+                from: vec![sent_tx.from_address],
+                to: vec![sent_tx.to_address.clone()],
+                total_amount: tx_amounts.total,
+                spent_by_me: tx_amounts.spent_by_me,
+                received_by_me: tx_amounts.received_by_me,
+                my_balance_change: tx_amounts.my_balance_change,
+                tx_hash: args.tx_hash,
+                tx_hex: args.tx_body_msg.into(),
+                fee_details: Some(args.fee_details),
+                block_height: args.block_height,
+                coin: tx_coin_ticker.to_string(),
+                internal_id: args.internal_id,
+                timestamp: common::now_ms() / 1000,
+                kmd_rewards: None,
+                transaction_type: Default::default(),
+            }))
+        }
+
+        async fn parse_claim_htlc_tx_details<Coin, Storage>(
+            args: ParseTxDetailsArgs<Coin, Storage, '_>,
+        ) -> Result<Option<TransactionDetails>, StopReason>
+        where
+            Coin: TendermintTxHistoryOps,
+            Storage: TxHistoryStorage,
+        {
+            let htlc_tx =
+                ClaimHtlcProtoRep::decode(args.tx_body_msg).map_err(|e| StopReason::Marshaling(e.to_string()))?;
+
+            let htlc_response = args
+                .coin
+                .query_htlc(htlc_tx.id)
+                .await
+                .map_err(|e| StopReason::RpcClient(e.to_string()))?;
+
+            let htlc_data = match htlc_response.htlc {
+                Some(htlc) => htlc,
+                None => return Ok(None),
+            };
+
+            match htlc_data.state {
+                HTLC_STATE_OPEN | HTLC_STATE_COMPLETED | HTLC_STATE_REFUNDED => {},
+                _unexpected_state => return Ok(None),
+            };
+
+            let coin_amount = htlc_data
+                .amount
+                .first()
+                .ok_or_else(|| StopReason::Marshaling("amount can't be empty".to_string()))?;
+
+            let denom = coin_amount.denom.to_lowercase();
+            let tx_coin_ticker = match args.active_assets.get(&denom) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+
+            let wallet_id = WalletId::new(tx_coin_ticker.replace('-', "_"));
+            if matches!(
+                args.storage.get_tx_from_history(&wallet_id, &args.internal_id).await,
+                Ok(Some(_))
+            ) {
+                log::debug!("Tx '{}' already exists in tx_history. Skipping it.", &args.tx_hash);
+                return Ok(None);
+            } else {
+                log::debug!("Adding tx: '{}' to tx_history.", &args.tx_hash);
+            }
+
+            let address = args.coin.my_address().expect("my_address can't fail");
+            let tx_amounts = get_tx_amounts(coin_amount, args.coin.decimals(), htlc_data.sender == address)
+                .map_err(StopReason::Marshaling)?;
+
+            Ok(Some(TransactionDetails {
+                from: vec![htlc_data.sender],
+                to: vec![htlc_data.to.clone()],
+                total_amount: tx_amounts.total,
+                spent_by_me: tx_amounts.spent_by_me,
+                received_by_me: tx_amounts.received_by_me,
+                my_balance_change: tx_amounts.my_balance_change,
+                tx_hash: args.tx_hash,
+                tx_hex: args.tx_body_msg.into(),
+                fee_details: Some(args.fee_details),
+                block_height: args.block_height,
+                coin: tx_coin_ticker.to_string(),
+                internal_id: args.internal_id,
+                timestamp: common::now_ms() / 1000,
+                kmd_rewards: None,
+                transaction_type: Default::default(),
+            }))
+        }
+
+        async fn parse_create_htlc_tx_details<Coin, Storage>(
+            args: ParseTxDetailsArgs<Coin, Storage, '_>,
+        ) -> Result<Option<TransactionDetails>, StopReason>
+        where
+            Coin: TendermintTxHistoryOps,
+            Storage: TxHistoryStorage,
+        {
+            let htlc_tx =
+                CreateHtlcProtoRep::decode(args.tx_body_msg).map_err(|e| StopReason::Marshaling(e.to_string()))?;
+
+            let coin_amount = htlc_tx
+                .amount
+                .first()
+                .ok_or_else(|| StopReason::Marshaling("amount can't be empty".to_string()))?;
+
+            let denom = coin_amount.denom.to_lowercase();
+            let tx_coin_ticker = match args.active_assets.get(&denom) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+
+            let wallet_id = WalletId::new(tx_coin_ticker.replace('-', "_"));
+            if matches!(
+                args.storage.get_tx_from_history(&wallet_id, &args.internal_id).await,
+                Ok(Some(_))
+            ) {
+                log::debug!("Tx '{}' already exists in tx_history. Skipping it.", &args.tx_hash);
+                return Ok(None);
+            } else {
+                log::debug!("Adding tx: '{}' to tx_history.", &args.tx_hash);
+            }
+
+            let address = args.coin.my_address().expect("my_address can't fail");
+            let tx_amounts = get_tx_amounts(coin_amount, args.coin.decimals(), htlc_tx.sender == address)
+                .map_err(StopReason::Marshaling)?;
+
+            Ok(Some(TransactionDetails {
+                from: vec![htlc_tx.sender],
+                to: vec![htlc_tx.to.clone()],
+                total_amount: tx_amounts.total,
+                spent_by_me: tx_amounts.spent_by_me,
+                received_by_me: tx_amounts.received_by_me,
+                my_balance_change: tx_amounts.my_balance_change,
+                tx_hash: args.tx_hash,
+                tx_hex: args.tx_body_msg.into(),
+                fee_details: Some(args.fee_details),
+                block_height: args.block_height,
+                coin: tx_coin_ticker.to_string(),
+                internal_id: args.internal_id,
+                timestamp: common::now_ms() / 1000,
+                kmd_rewards: None,
+                transaction_type: Default::default(),
+            }))
         }
 
         async fn fetch_and_insert_txs<Coin, Storage>(
@@ -271,7 +508,7 @@ where
                     "tx search rpc call failed"
                 );
 
-                let mut tx_details: HashMap<String, Vec<crate::TransactionDetails>> = HashMap::new();
+                let mut tx_details: HashMap<String, Vec<TransactionDetails>> = HashMap::new();
                 for tx in response.txs {
                     let internal_id = H256::from(tx.hash.as_bytes()).reversed().to_vec().into();
 
@@ -281,25 +518,11 @@ where
                         "Could not deserialize transaction"
                     );
 
-                    let fee = deserialized_tx.auth_info.fee;
-
-                    let fee_coin = try_or_return_stopped_as_err!(
-                        fee.amount.first().ok_or("fee coin can't be empty"),
+                    let fee_details = try_or_return_stopped_as_err!(
+                        get_fee_details(deserialized_tx.auth_info.fee, coin),
                         StopReason::Marshaling,
-                        "Fee coin is empty"
+                        "get_fee_details failed"
                     );
-
-                    let fee_amount = try_or_return_stopped_as_err!(
-                        fee_coin.amount.to_string().parse(),
-                        StopReason::Marshaling,
-                        "Fee amount parsing into u64 failed"
-                    );
-
-                    let fee_details = TxFeeDetails::Tendermint(TendermintFeeDetails {
-                        coin: coin.platform_ticker().to_string(),
-                        amount: big_decimal_from_sat_unsigned(fee_amount, coin.decimals()),
-                        gas_limit: fee.gas_limit.value(),
-                    });
 
                     let msg = try_or_return_stopped_as_err!(
                         deserialized_tx.body.messages.first().ok_or("Tx body couldn't be read."),
@@ -307,239 +530,62 @@ where
                         "Tx body messages is empty"
                     );
 
-                    match msg.type_url.as_str() {
-                        SEND_TYPE_URL => {
-                            let sent_tx = try_or_return_stopped_as_err!(
-                                MsgSend::decode(msg.value.as_slice()),
-                                StopReason::Marshaling,
-                                "Decoding MsgSend failed"
-                            );
-                            let coin_amount = try_or_return_stopped_as_err!(
-                                sent_tx.amount.first().ok_or("amount can't be empty"),
-                                StopReason::Marshaling,
-                                "MsgSend amount is empty"
-                            );
-
-                            let denom = coin_amount.denom.to_lowercase();
-                            let tx_coin_ticker = match active_assets.get(&denom) {
-                                Some(t) => t,
-                                None => continue,
-                            };
-
-                            if is_tx_exists(storage, &WalletId::new(tx_coin_ticker.replace('-', "_")), &internal_id)
-                                .await
-                            {
-                                log::debug!(
-                                    "Tx '{}' already exists in tx_history. Skipping it.",
-                                    tx.hash.to_string()
-                                );
-                                continue;
-                            } else {
-                                log::debug!("Adding tx: '{}' to tx_history.", tx.hash.to_string());
-                            }
-
-                            let amount: u64 = try_or_return_stopped_as_err!(
-                                coin_amount.amount.parse(),
-                                StopReason::Marshaling,
-                                "Amount parsing into u64 failed"
-                            );
-                            let amount = big_decimal_from_sat_unsigned(amount, coin.decimals());
-
-                            let (spent_by_me, received_by_me) =
-                                if sent_tx.from_address == coin.my_address().expect("my_address can't fail") {
-                                    (amount.clone(), BigDecimal::default())
-                                } else {
-                                    (BigDecimal::default(), amount.clone())
-                                };
-
-                            let details = crate::TransactionDetails {
-                                from: vec![sent_tx.from_address],
-                                to: vec![sent_tx.to_address.clone()],
-                                total_amount: amount,
-                                spent_by_me: spent_by_me.clone(),
-                                received_by_me: received_by_me.clone(),
-                                my_balance_change: received_by_me - spent_by_me,
-                                tx_hash: tx.hash.to_string(),
-                                tx_hex: msg.value.as_slice().into(),
-                                fee_details: Some(fee_details),
-                                block_height: tx.height.into(),
-                                coin: tx_coin_ticker.to_string(),
-                                internal_id,
-                                timestamp: common::now_ms() / 1000,
-                                kmd_rewards: None,
-                                transaction_type: Default::default(),
-                            };
-
-                            match tx_details.entry(tx_coin_ticker.to_string()) {
-                                Entry::Vacant(e) => {
-                                    e.insert(vec![details]);
-                                },
-                                Entry::Occupied(mut e) => {
-                                    e.get_mut().push(details);
-                                },
-                            };
-                        },
-                        CLAIM_HTLC_TYPE_URL => {
-                            let htlc_tx = try_or_return_stopped_as_err!(
-                                ClaimHtlcProtoRep::decode(msg.value.as_slice()),
-                                StopReason::Marshaling,
-                                "Decoding ClaimHtlcProtoRep failed"
-                            );
-                            let htlc_response = try_or_return_stopped_as_err!(
-                                coin.query_htlc(htlc_tx.id).await,
-                                StopReason::RpcClient,
-                                "Htlc query rpc call failed"
-                            );
-
-                            let htlc_data = match htlc_response.htlc {
-                                Some(htlc) => htlc,
-                                None => continue,
-                            };
-
-                            match htlc_data.state {
-                                HTLC_STATE_OPEN | HTLC_STATE_COMPLETED | HTLC_STATE_REFUNDED => {},
-                                _unexpected_state => continue,
-                            };
-
-                            let coin_amount = try_or_return_stopped_as_err!(
-                                htlc_data.amount.first().ok_or("amount can't be empty"),
-                                StopReason::Marshaling,
-                                "Htlc amount is empty"
-                            );
-
-                            let denom = coin_amount.denom.to_lowercase();
-                            let tx_coin_ticker = match active_assets.get(&denom) {
-                                Some(t) => t,
-                                None => continue,
-                            };
-
-                            if is_tx_exists(storage, &WalletId::new(tx_coin_ticker.replace('-', "_")), &internal_id)
-                                .await
-                            {
-                                log::debug!(
-                                    "Tx '{}' already exists in tx_history. Skipping it.",
-                                    tx.hash.to_string()
-                                );
-                                continue;
-                            } else {
-                                log::debug!("Adding tx: '{}' to tx_history.", tx.hash.to_string());
-                            }
-
-                            let amount: u64 = try_or_return_stopped_as_err!(
-                                coin_amount.amount.parse(),
-                                StopReason::Marshaling,
-                                "Amount parsing into u64 failed"
-                            );
-                            let amount = big_decimal_from_sat_unsigned(amount, coin.decimals());
-
-                            let (spent_by_me, received_by_me) =
-                                if htlc_data.sender == coin.my_address().expect("my_address can't fail") {
-                                    (amount.clone(), BigDecimal::default())
-                                } else {
-                                    (BigDecimal::default(), amount.clone())
-                                };
-
-                            let details = crate::TransactionDetails {
-                                from: vec![htlc_data.sender],
-                                to: vec![htlc_data.to.clone()],
-                                total_amount: amount,
-                                spent_by_me: spent_by_me.clone(),
-                                received_by_me: received_by_me.clone(),
-                                my_balance_change: received_by_me - spent_by_me,
-                                tx_hash: tx.hash.to_string(),
-                                tx_hex: msg.value.as_slice().into(),
-                                fee_details: Some(fee_details),
-                                block_height: tx.height.into(),
-                                coin: tx_coin_ticker.to_string(),
-                                internal_id,
-                                timestamp: common::now_ms() / 1000,
-                                kmd_rewards: None,
-                                transaction_type: Default::default(),
-                            };
-
-                            match tx_details.entry(tx_coin_ticker.to_string()) {
-                                Entry::Vacant(e) => {
-                                    e.insert(vec![details]);
-                                },
-                                Entry::Occupied(mut e) => {
-                                    e.get_mut().push(details);
-                                },
-                            };
-                        },
-                        CREATE_HTLC_TYPE_URL => {
-                            let htlc_tx = try_or_return_stopped_as_err!(
-                                CreateHtlcProtoRep::decode(msg.value.as_slice()),
-                                StopReason::Marshaling,
-                                "Decoding CreateHtlcProtoRep failed"
-                            );
-
-                            let coin_amount = try_or_return_stopped_as_err!(
-                                htlc_tx.amount.first().ok_or("amount can't be empty"),
-                                StopReason::Marshaling,
-                                "Htlc amount is empty"
-                            );
-
-                            let denom = coin_amount.denom.to_lowercase();
-                            let tx_coin_ticker = match active_assets.get(&denom) {
-                                Some(t) => t,
-                                None => continue,
-                            };
-
-                            if is_tx_exists(storage, &WalletId::new(tx_coin_ticker.replace('-', "_")), &internal_id)
-                                .await
-                            {
-                                log::debug!(
-                                    "Tx '{}' already exists in tx_history. Skipping it.",
-                                    tx.hash.to_string()
-                                );
-                                continue;
-                            } else {
-                                log::debug!("Adding tx: '{}' to tx_history.", tx.hash.to_string());
-                            }
-
-                            let amount: u64 = try_or_return_stopped_as_err!(
-                                coin_amount.amount.parse(),
-                                StopReason::Marshaling,
-                                "Amount parsing into u64 failed"
-                            );
-                            let amount = big_decimal_from_sat_unsigned(amount, coin.decimals());
-
-                            let (spent_by_me, received_by_me) =
-                                if htlc_tx.sender == coin.my_address().expect("my_address can't fail") {
-                                    (amount.clone(), BigDecimal::default())
-                                } else {
-                                    (BigDecimal::default(), amount.clone())
-                                };
-
-                            let details = crate::TransactionDetails {
-                                from: vec![htlc_tx.sender],
-                                to: vec![htlc_tx.to.clone()],
-                                total_amount: amount,
-                                spent_by_me: spent_by_me.clone(),
-                                received_by_me: received_by_me.clone(),
-                                my_balance_change: received_by_me - spent_by_me,
-                                tx_hash: tx.hash.to_string(),
-                                tx_hex: msg.value.as_slice().into(),
-                                fee_details: Some(fee_details),
-                                block_height: tx.height.into(),
-                                coin: tx_coin_ticker.to_string(),
-                                internal_id,
-                                timestamp: common::now_ms() / 1000,
-                                kmd_rewards: None,
-                                transaction_type: Default::default(),
-                            };
-
-                            match tx_details.entry(tx_coin_ticker.to_string()) {
-                                Entry::Vacant(e) => {
-                                    e.insert(vec![details]);
-                                },
-                                Entry::Occupied(mut e) => {
-                                    e.get_mut().push(details);
-                                },
-                            };
-                        },
-                        _ => {},
+                    // If we don't get expected type_url, then continue.
+                    // (This check exists for not allocating ParseTxDetailsArgs when we don't use
+                    // it. We could use it in match statement but that way we have to duplicate ~10
+                    // lines of code for each pattern.)
+                    if ![SEND_TYPE_URL, CLAIM_HTLC_TYPE_URL, CREATE_HTLC_TYPE_URL].contains(&msg.type_url.as_str()) {
+                        continue;
                     }
+
+                    let args = ParseTxDetailsArgs {
+                        coin,
+                        storage,
+                        active_assets,
+                        internal_id,
+                        block_height: tx.height.into(),
+                        tx_hash: tx.hash.to_string(),
+                        tx_body_msg: msg.value.as_slice(),
+                        fee_details,
+                    };
+
+                    let details = match msg.type_url.as_str() {
+                        SEND_TYPE_URL => match parse_send_tx_details(args).await {
+                            Ok(details) => details,
+                            Err(e) => {
+                                return Err(Stopped {
+                                    phantom: Default::default(),
+                                    stop_reason: e,
+                                });
+                            },
+                        },
+                        CLAIM_HTLC_TYPE_URL => match parse_claim_htlc_tx_details(args).await {
+                            Ok(details) => details,
+                            Err(e) => {
+                                return Err(Stopped {
+                                    phantom: Default::default(),
+                                    stop_reason: e,
+                                });
+                            },
+                        },
+                        CREATE_HTLC_TYPE_URL => match parse_create_htlc_tx_details(args).await {
+                            Ok(details) => details,
+                            Err(e) => {
+                                return Err(Stopped {
+                                    phantom: Default::default(),
+                                    stop_reason: e,
+                                });
+                            },
+                        },
+                        _ => continue,
+                    };
+
+                    let details = match details {
+                        Some(details) => details,
+                        None => continue,
+                    };
+
+                    upsert_tx_details(&mut tx_details, details);
                 }
 
                 for (ticker, txs) in tx_details.into_iter() {
@@ -562,9 +608,7 @@ where
             Ok(())
         }
 
-        let address = ctx.coin.my_address().expect("my_address can't fail");
-
-        let q = format!("transfer.sender = '{}'", address.clone());
+        let q = format!("transfer.sender = '{}'", self.address.clone());
         if let Err(stopped) = fetch_and_insert_txs(&ctx.coin, &ctx.storage, q, &self.active_assets).await {
             return Self::change_state(stopped);
         };
@@ -631,15 +675,11 @@ where
             ctx.coin.ticker(),
             self.stop_reason
         );
-        let new_state_json = match self.stop_reason {
-            StopReason::HistoryTooLarge => json!({
-                "code": crate::utxo::utxo_common::HISTORY_TOO_LARGE_ERR_CODE,
-                "message": "Got `history too large` error from Electrum server. History is not available",
-            }),
-            reason => json!({
-                "message": format!("{:?}", reason),
-            }),
-        };
+
+        let new_state_json = json!({
+            "message": format!("{:?}", self.stop_reason),
+        });
+
         ctx.coin.set_history_sync_state(HistorySyncState::Error(new_state_json));
     }
 }

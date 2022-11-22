@@ -386,7 +386,7 @@ pub fn morty_conf() -> Json {
 pub fn atom_testnet_conf() -> Json {
     json!({
         "coin":"ATOM",
-        "avg_blocktime": 0.09,
+        "avg_blocktime": 5,
         "protocol":{
             "type":"TENDERMINT",
             "protocol_data": {
@@ -512,7 +512,7 @@ pub fn eth_jst_testnet_conf() -> Json {
 pub fn iris_testnet_conf() -> Json {
     json!({
         "coin": "IRIS-TEST",
-        "avg_blocktime": 0.09,
+        "avg_blocktime": 5,
         "derivation_path": "m/44'/566'",
         "protocol":{
             "type":"TENDERMINT",

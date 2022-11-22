@@ -120,12 +120,23 @@ pub struct TendermintConf {
 
 impl TendermintConf {
     pub fn try_from_json(ticker: &str, conf: &Json) -> MmResult<Self, TendermintInitError> {
-        let avg_blocktime = conf["avg_blocktime"].as_f64().unwrap_or_default();
-        let avg_blocktime = (avg_blocktime * 60.0).round() as i64;
+        let avg_blocktime = conf.get("avg_blocktime").ok_or({
+            TendermintInitError {
+                ticker: ticker.to_string(),
+                kind: TendermintInitErrorKind::AvgBlockTimeMissing,
+            }
+        })?;
+
+        let avg_blocktime = avg_blocktime.as_i64().ok_or({
+            TendermintInitError {
+                ticker: ticker.to_string(),
+                kind: TendermintInitErrorKind::AvgBlockTimeInvalid,
+            }
+        })?;
 
         let avg_blocktime = u8::try_from(avg_blocktime).map_err(|_| TendermintInitError {
             ticker: ticker.to_string(),
-            kind: TendermintInitErrorKind::AvgBlockTimeMissingOrInvalid,
+            kind: TendermintInitErrorKind::AvgBlockTimeInvalid,
         })?;
 
         let derivation_path = json::from_value(conf["derivation_path"].clone()).map_to_mm(|e| TendermintInitError {
@@ -192,10 +203,10 @@ pub enum TendermintInitErrorKind {
     ErrorDeserializingDerivationPath(String),
     PrivKeyPolicyNotAllowed(PrivKeyPolicyNotAllowed),
     RpcError(String),
-    #[display(
-        fmt = "avg_blocktime missing or invalid. Value must be greater than '0' and less than less than '4.25'."
-    )]
-    AvgBlockTimeMissingOrInvalid,
+    #[display(fmt = "avg_blocktime is missing in coin configuration")]
+    AvgBlockTimeMissing,
+    #[display(fmt = "avg_blocktime must be in-between '0' and '255'.")]
+    AvgBlockTimeInvalid,
 }
 
 #[derive(Display, Debug)]
@@ -1232,7 +1243,7 @@ impl TendermintCoin {
         if let Some(tx_response) = tx.tx_response {
             // non-zero values are error.
             match tx_response.code {
-                0 => Ok(Some(cosmrs::tendermint::abci::Code::Ok)),
+                TX_SUCCESS_CODE => Ok(Some(cosmrs::tendermint::abci::Code::Ok)),
                 err_code => Ok(Some(cosmrs::tendermint::abci::Code::Err(err_code))),
             }
         } else {
@@ -1682,10 +1693,10 @@ impl MarketCoinOps for TendermintCoin {
         wait_until: u64,
         check_every: u64,
     ) -> Box<dyn Future<Item = (), Error = String> + Send> {
-        let tx_raw: TxRaw = try_fus!(Message::decode(tx_bytes));
-        let tx = TransactionEnum::CosmosTransaction(CosmosTransaction { data: tx_raw });
-        let mut tx_hash = hex::encode_upper(tx.tx_hash().0);
-        tx_hash.make_ascii_uppercase();
+        // Sanity check
+        let _: TxRaw = try_fus!(Message::decode(tx_bytes));
+
+        let tx_hash = hex::encode_upper(sha256(tx_bytes));
 
         let coin = self.clone();
         let fut = async move {
