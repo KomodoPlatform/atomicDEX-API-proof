@@ -5,10 +5,10 @@ use super::rpc::*;
 use crate::coin_errors::{MyAddressError, ValidatePaymentError};
 use crate::utxo::sat_from_big_decimal;
 use crate::utxo::utxo_common::big_decimal_from_sat;
-use crate::{big_decimal_from_sat_unsigned, BalanceError, BalanceFut, BigDecimal, CheckIfMyPaymentSentArgs,
-            CoinBalance, CoinFutSpawner, FeeApproxStage, FoundSwapTxSpend, HistorySyncState, MarketCoinOps, MmCoin,
+use crate::{big_decimal_from_sat_unsigned, BalanceFut, BigDecimal, CheckIfMyPaymentSentArgs, CoinBalance,
+            CoinFutSpawner, FeeApproxStage, FoundSwapTxSpend, HistorySyncState, MarketCoinOps, MmCoin,
             NegotiateSwapContractAddrErr, PaymentInstructions, PaymentInstructionsErr, PrivKeyBuildPolicy,
-            PrivKeyPolicyNotAllowed, RawTransactionError, RawTransactionFut, RawTransactionRequest, RawTransactionRes,
+            PrivKeyPolicyNotAllowed, RawTransactionFut, RawTransactionRequest, RawTransactionRes,
             SearchForSwapTxSpendInput, SendMakerPaymentArgs, SendMakerRefundsPaymentArgs,
             SendMakerSpendsTakerPaymentArgs, SendTakerPaymentArgs, SendTakerRefundsPaymentArgs,
             SendTakerSpendsMakerPaymentArgs, SignatureError, SignatureResult, SwapOps, TradeFee, TradePreimageError,
@@ -55,7 +55,6 @@ use rpc::v1::types::Bytes as BytesJson;
 use serde_json::{self as json, Value as Json};
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -169,13 +168,7 @@ pub struct TendermintCoinImpl {
 }
 
 #[derive(Clone)]
-pub struct TendermintCoin(Arc<TendermintCoinImpl>);
-
-impl Deref for TendermintCoin {
-    type Target = TendermintCoinImpl;
-
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
+pub struct TendermintCoin(pub(crate) Arc<TendermintCoinImpl>);
 
 #[derive(Debug)]
 pub struct TendermintInitError {
@@ -211,52 +204,6 @@ pub enum TendermintCoinRpcError {
     PerformError(String),
 }
 
-impl From<DecodeError> for TendermintCoinRpcError {
-    fn from(err: DecodeError) -> Self { TendermintCoinRpcError::Prost(err) }
-}
-
-impl From<TendermintCoinRpcError> for WithdrawError {
-    fn from(err: TendermintCoinRpcError) -> Self { WithdrawError::Transport(err.to_string()) }
-}
-
-impl From<TendermintCoinRpcError> for BalanceError {
-    fn from(err: TendermintCoinRpcError) -> Self {
-        match err {
-            TendermintCoinRpcError::InvalidResponse(e) => BalanceError::InvalidResponse(e),
-            TendermintCoinRpcError::Prost(e) => BalanceError::InvalidResponse(e.to_string()),
-            TendermintCoinRpcError::PerformError(e) => BalanceError::Transport(e),
-        }
-    }
-}
-
-impl From<TendermintCoinRpcError> for ValidatePaymentError {
-    fn from(err: TendermintCoinRpcError) -> Self {
-        match err {
-            TendermintCoinRpcError::InvalidResponse(e) => ValidatePaymentError::InvalidRpcResponse(e),
-            TendermintCoinRpcError::Prost(e) => ValidatePaymentError::InvalidRpcResponse(e.to_string()),
-            TendermintCoinRpcError::PerformError(e) => ValidatePaymentError::Transport(e),
-        }
-    }
-}
-
-impl From<TendermintCoinRpcError> for TradePreimageError {
-    fn from(err: TendermintCoinRpcError) -> Self { TradePreimageError::Transport(err.to_string()) }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl From<tendermint_rpc::Error> for TendermintCoinRpcError {
-    fn from(err: tendermint_rpc::Error) -> Self { TendermintCoinRpcError::PerformError(err.to_string()) }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl From<PerformError> for TendermintCoinRpcError {
-    fn from(err: PerformError) -> Self { TendermintCoinRpcError::PerformError(err.to_string()) }
-}
-
-impl From<TendermintCoinRpcError> for RawTransactionError {
-    fn from(err: TendermintCoinRpcError) -> Self { RawTransactionError::Transport(err.to_string()) }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct CosmosTransaction {
     pub data: cosmrs::proto::cosmos::tx::v1beta1::TxRaw,
@@ -288,14 +235,6 @@ pub enum AccountIdFromPubkeyHexErr {
     CouldNotCreateAccountId(ErrorReport),
 }
 
-impl From<FromHexError> for AccountIdFromPubkeyHexErr {
-    fn from(err: FromHexError) -> Self { AccountIdFromPubkeyHexErr::InvalidHexString(err) }
-}
-
-impl From<ErrorReport> for AccountIdFromPubkeyHexErr {
-    fn from(err: ErrorReport) -> Self { AccountIdFromPubkeyHexErr::CouldNotCreateAccountId(err) }
-}
-
 pub fn account_id_from_pubkey_hex(prefix: &str, pubkey: &str) -> MmResult<AccountId, AccountIdFromPubkeyHexErr> {
     let pubkey_bytes = hex::decode(pubkey)?;
     let pubkey_hash = dhash160(&pubkey_bytes);
@@ -309,25 +248,13 @@ pub struct AllBalancesResult {
 }
 
 #[derive(Debug, Display)]
-enum SearchForSwapTxSpendErr {
+pub(crate) enum SearchForSwapTxSpendErr {
     Cosmrs(ErrorReport),
     Rpc(TendermintCoinRpcError),
     TxMessagesEmpty,
     ClaimHtlcTxNotFound,
     UnexpectedHtlcState(i32),
     Proto(DecodeError),
-}
-
-impl From<ErrorReport> for SearchForSwapTxSpendErr {
-    fn from(e: ErrorReport) -> Self { SearchForSwapTxSpendErr::Cosmrs(e) }
-}
-
-impl From<TendermintCoinRpcError> for SearchForSwapTxSpendErr {
-    fn from(e: TendermintCoinRpcError) -> Self { SearchForSwapTxSpendErr::Rpc(e) }
-}
-
-impl From<DecodeError> for SearchForSwapTxSpendErr {
-    fn from(e: DecodeError) -> Self { SearchForSwapTxSpendErr::Proto(e) }
 }
 
 impl TendermintCoin {

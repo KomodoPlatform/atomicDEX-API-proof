@@ -16,7 +16,7 @@ use crate::{big_decimal_from_sat_unsigned, utxo::sat_from_big_decimal, BalanceFu
 use async_trait::async_trait;
 use bitcrypto::sha256;
 use common::executor::abortable_queue::AbortableQueue;
-use common::executor::{AbortableSystem, AbortedError};
+use common::executor::AbortableSystem;
 use common::log::warn;
 use common::Future01CompatExt;
 use cosmrs::{bank::MsgSend,
@@ -30,7 +30,6 @@ use mm2_err_handle::prelude::*;
 use mm2_number::MmNumber;
 use rpc::v1::types::Bytes as BytesJson;
 use serde_json::Value as Json;
-use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -45,13 +44,7 @@ pub struct TendermintTokenImpl {
 }
 
 #[derive(Clone)]
-pub struct TendermintToken(Arc<TendermintTokenImpl>);
-
-impl Deref for TendermintToken {
-    type Target = TendermintTokenImpl;
-
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
+pub struct TendermintToken(pub(crate) Arc<TendermintTokenImpl>);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TendermintTokenProtocolInfo {
@@ -68,14 +61,6 @@ pub enum TendermintTokenInitError {
     InvalidDenom(String),
     MyAddressError(String),
     CouldNotFetchBalance(String),
-}
-
-impl From<MyAddressError> for TendermintTokenInitError {
-    fn from(err: MyAddressError) -> Self { TendermintTokenInitError::MyAddressError(err.to_string()) }
-}
-
-impl From<AbortedError> for TendermintTokenInitError {
-    fn from(e: AbortedError) -> Self { TendermintTokenInitError::Internal(e.to_string()) }
 }
 
 impl TendermintToken {
